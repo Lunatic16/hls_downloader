@@ -7,7 +7,7 @@
 One file. Two dependencies. No install.
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue?logo=python&logoColor=white)](#-installation)
-[![Dependencies](https://img.shields.io/badge/deps-requests%2C%20pycryptodome%2C%20browser--cookie3%20(optional)-orange)](#-installation)
+[![Dependencies](https://img.shields.io/badge/deps-requests%2C%20pycryptodome-orange)](#-installation) [![Optional Dependencies](https://img.shields.io/badge/optional%20deps-browser--cookie3-blue)](#-installation)
 [![ffmpeg](https://img.shields.io/badge/ffmpeg-optional-3DA639?logo=ffmpeg&logoColor=white)](#-installation)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey?logo=gnubash&logoColor=white)](#-installation)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-21BB76)](#-contributing)
