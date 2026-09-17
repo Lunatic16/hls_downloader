@@ -261,7 +261,7 @@ Issues and PRs welcome. Good first targets: any `EXT-X` tag the parser doesn't k
      then swap this section and the badge above:
      [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE) -->
 
-Not yet licensed — see [choosealicense.com](https://choosealicense.com/) before publishing.
+Distributed under the MIT License.
 
 ## 🚨 Disclaimer
 
