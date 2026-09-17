@@ -221,7 +221,7 @@ No — by design. Only standard HLS AES-128 (clearkey) streams are decrypted. If
 </details>
 
 <details>
-<summary><b>Why is my <code>--rate 1</code> download slow?</b></summary>
+<summary><b>Why is my --rate 1 download slow?</b></summary>
 
 It's pacing to one request per second across everything — manifests, keys, segments, live polls. For a 987-segment VOD that's a ~17-minute floor. That's the point: it keeps you inside limits like "no more than 1 request per second."
 </details>
