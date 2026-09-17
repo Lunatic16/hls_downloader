@@ -46,7 +46,7 @@ One file. Two dependencies. No install.
 
 ```bash
 git clone https://github.com/Lunatic16/hls_downloader.git
-cd hls-downloader
+cd hls_downloader
 pip install -r requirements.txt        # requests, pycryptodome
 ```
 
