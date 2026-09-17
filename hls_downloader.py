@@ -25,6 +25,7 @@ import shlex
 import sys
 import shutil
 import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -44,6 +45,31 @@ try:
     HAS_CRYPTO = True
 except ImportError:
     HAS_CRYPTO = False
+
+try:
+    import browser_cookie3
+    HAS_BROWSER_COOKIE3 = True
+except ImportError:
+    HAS_BROWSER_COOKIE3 = False
+
+
+# Segment count above which an available aria2c is used automatically
+# (roadmap: "optional aria2c backend for very large segment counts").
+ARIA2C_AUTO_THRESHOLD = 300
+
+# browser-cookie3 function name per --cookies-from-browser choice. Some of
+# these only work on the platform the browser actually ships on (e.g. Safari
+# is macOS-only); browser_cookie3 raises if the store isn't found there.
+BROWSER_COOKIE_LOADERS = {
+    "firefox": "firefox",
+    "chrome": "chrome",
+    "chromium": "chromium",
+    "edge": "edge",
+    "brave": "brave",
+    "opera": "opera",
+    "vivaldi": "vivaldi",
+    "safari": "safari",
+}
 
 
 # --------------------------------------------------------------------------
@@ -187,11 +213,13 @@ def get_cached_profile(host):
     return _load_profiles().get(host)
 
 
-def remember_profile(host, referer=None, origin=None, user_agent=None):
+def remember_profile(host, referer=None, origin=None, user_agent=None, rate=None):
     """Only called with explicitly user-supplied values — never with
     auto-derived guesses — so the cache only ever holds confirmed-working
-    headers. Cookies are deliberately NOT remembered here (credentials)."""
-    if not host or not any([referer, origin, user_agent]):
+    headers. Cookies are deliberately NOT remembered here (credentials).
+    `rate` (requests/sec) is remembered the same way, alongside headers, so
+    a host's polite pace only has to be discovered once."""
+    if not host or not any([referer, origin, user_agent, rate]):
         return
     profiles = _load_profiles()
     entry = profiles.get(host, {})
@@ -201,6 +229,8 @@ def remember_profile(host, referer=None, origin=None, user_agent=None):
         entry["origin"] = origin
     if user_agent:
         entry["user_agent"] = user_agent
+    if rate:
+        entry["rate"] = rate
     profiles[host] = entry
     _save_profiles(profiles)
 
@@ -240,6 +270,26 @@ def _parse_cookie_header(raw):
             name, _, value = part.partition("=")
             out[name.strip()] = value.strip()
     return out
+
+
+def load_browser_cookies(browser, host):
+    """Read cookies for `host` straight out of an installed browser's cookie
+    store via browser-cookie3, keyed the same way --cookie is: {name: value}.
+    Explicit --cookie values (applied after this in build_session) win on
+    any name collision."""
+    if not HAS_BROWSER_COOKIE3:
+        sys.exit("--cookies-from-browser needs the browser-cookie3 package. "
+                  "Run: pip install browser-cookie3")
+    loader_name = BROWSER_COOKIE_LOADERS.get(browser)
+    loader = getattr(browser_cookie3, loader_name, None) if loader_name else None
+    if loader is None:
+        sys.exit(f"--cookies-from-browser: unsupported browser '{browser}'")
+    try:
+        jar = loader(domain_name=host) if host else loader()
+    except Exception as e:
+        sys.exit(f"Couldn't read {browser} cookies (is {browser} closed? "
+                  f"some browsers lock their cookie DB while running): {e}")
+    return {c.name: c.value for c in jar}
 
 
 def _is_local_host(url):
@@ -285,7 +335,7 @@ def derive_headers(m3u8_url, page_url=None, referer=None, origin=None):
 
 
 def build_session(m3u8_url=None, page_url=None, referer=None, origin=None,
-                   user_agent=None, cookie=None, retries=3):
+                   user_agent=None, cookie=None, cookies_from_browser=None, retries=3):
     """Scoped session: retries+backoff, auto-derived Referer/Origin (with
     explicit overrides), an optional raw Cookie header, and SSL warnings
     silenced only for this session rather than globally."""
@@ -302,6 +352,15 @@ def build_session(m3u8_url=None, page_url=None, referer=None, origin=None,
     if origin:
         headers["Origin"] = origin
     session.headers.update(headers)
+    if cookies_from_browser:
+        host = urlparse(m3u8_url).hostname if m3u8_url else None
+        browser_cookies = load_browser_cookies(cookies_from_browser, host)
+        if browser_cookies:
+            session.cookies.update(browser_cookies)
+            status(f"Loaded {len(browser_cookies)} cookie(s) from {cookies_from_browser} "
+                   f"for {host}", C.GRAY)
+        else:
+            warn(f"No cookies found in {cookies_from_browser} for {host}")
     if cookie:
         parsed = _parse_cookie_header(cookie)
         if parsed:
@@ -395,9 +454,11 @@ def fetch(session, url, byte_range=None, timeout=30):
 # --------------------------------------------------------------------------
 
 class Segment:
-    __slots__ = ("url", "seq", "key_info", "byte_range", "map_info", "duration", "is_ad")
+    __slots__ = ("url", "seq", "key_info", "byte_range", "map_info", "duration",
+                 "is_ad", "is_gap")
 
-    def __init__(self, url, seq, key_info, byte_range, map_info, duration, is_ad):
+    def __init__(self, url, seq, key_info, byte_range, map_info, duration, is_ad,
+                 is_gap=False):
         self.url = url
         self.seq = seq
         self.key_info = key_info
@@ -405,6 +466,7 @@ class Segment:
         self.map_info = map_info
         self.duration = duration
         self.is_ad = is_ad
+        self.is_gap = is_gap
 
 
 def _attr(line, name, quoted=True):
@@ -430,15 +492,23 @@ def _parse_byterange(spec, url, last_end):
 def parse_playlist(session, m3u8_url):
     """
     Parse an m3u8 file.
-    Returns (variants, segments, is_live, target_duration, audio_tracks, discontinuity_count):
+    Returns (variants, segments, is_live, target_duration, audio_tracks,
+             discontinuity_count, part_count):
       - variants: list of (url, resolution, bandwidth) if a master playlist
-      - segments: list of Segment if a media playlist
+      - segments: list of Segment if a media playlist. Segments tagged
+        #EXT-X-GAP have is_gap=True (the origin doesn't actually have that
+        segment — HLS players skip it rather than stall on it, and so do we)
       - is_live: True if no #EXT-X-ENDLIST was found (media playlists only)
       - target_duration: float, from #EXT-X-TARGETDURATION
       - audio_tracks: list of {name, language, url, default} from
         #EXT-X-MEDIA:TYPE=AUDIO entries (master playlists only)
       - discontinuity_count: number of #EXT-X-DISCONTINUITY tags seen
         (informational — not all discontinuities are ad breaks)
+      - part_count: number of #EXT-X-PART (low-latency HLS partial segment)
+        tags seen. We don't download these separately — by the time a
+        playlist is re-fetched the parts are normally already folded into a
+        full #EXTINF segment — this is reported so --probe can flag
+        low-latency sources where that assumption is worth double-checking.
     """
     text = fetch(session, m3u8_url).text
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -457,6 +527,8 @@ def parse_playlist(session, m3u8_url):
     is_live = True
     target_duration = 6.0
     discontinuity_count = 0
+    part_count = 0
+    pending_gap = False      # set by a preceding #EXT-X-GAP tag
     cue_state = False       # True while inside a CUE-OUT/CUE-IN ad break
 
     for line in lines:
@@ -487,6 +559,14 @@ def parse_playlist(session, m3u8_url):
 
         elif line.startswith("#EXT-X-DISCONTINUITY"):
             discontinuity_count += 1
+
+        elif line.startswith("#EXT-X-GAP"):
+            # Applies to the very next segment URI: the origin doesn't
+            # actually have it, so it must be skipped rather than fetched.
+            pending_gap = True
+
+        elif line.startswith("#EXT-X-PART:"):
+            part_count += 1
 
         elif line.startswith("#EXT-X-CUE-OUT"):
             cue_state = True
@@ -553,11 +633,14 @@ def parse_playlist(session, m3u8_url):
                     map_info=current_map,
                     duration=pending_duration,
                     is_ad=cue_state,
+                    is_gap=pending_gap,
                 ))
                 media_seq += 1
                 pending_duration = None
+                pending_gap = False
 
-    return variants, segments, is_live, target_duration, audio_tracks, discontinuity_count
+    return (variants, segments, is_live, target_duration, audio_tracks,
+            discontinuity_count, part_count)
 
 
 def select_variant(session, m3u8_url, preferred_height=None):
@@ -573,7 +656,7 @@ def select_variant(session, m3u8_url, preferred_height=None):
             raise RuntimeError("Circular master playlist reference detected.")
         seen.add(m3u8_url)
 
-        variants, _segments, _is_live, _td, tracks, _disc = parse_playlist(session, m3u8_url)
+        variants, _segments, _is_live, _td, tracks, _disc, _parts = parse_playlist(session, m3u8_url)
         if first:
             audio_tracks = tracks
             first = False
@@ -607,7 +690,8 @@ def select_variant(session, m3u8_url, preferred_height=None):
 def probe_playlist(session, url):
     """Dry-run: report variants, audio tracks, encryption, live/VOD status,
     and discontinuity markers without downloading anything."""
-    variants, segments, is_live, target_duration, audio_tracks, disc_count = parse_playlist(session, url)
+    variants, segments, is_live, target_duration, audio_tracks, disc_count, part_count = \
+        parse_playlist(session, url)
 
     if variants:
         status(f"Master playlist — {len(variants)} video quality level(s):")
@@ -621,7 +705,8 @@ def probe_playlist(session, url):
                       f"[{t.get('language') or '?'}]{tag}", file=sys.stderr)
         # Descend one level into the first variant for media-level info.
         media_url = variants[0][0]
-        _, segments, is_live, target_duration, _, disc_count = parse_playlist(session, media_url)
+        _, segments, is_live, target_duration, _, disc_count, part_count = \
+            parse_playlist(session, media_url)
 
     status(f"{'LIVE' if is_live else 'VOD'} playlist — {len(segments)} segment(s), "
            f"~{target_duration:.1f}s target duration", C.GREEN)
@@ -630,8 +715,15 @@ def probe_playlist(session, url):
     ad_segments = sum(1 for s in segments if s.is_ad)
     if ad_segments:
         status(f"{ad_segments} segment(s) inside CUE-OUT/CUE-IN ad breaks — use --skip-ads to drop them", C.YELLOW)
+    gap_segments = sum(1 for s in segments if s.is_gap)
+    if gap_segments:
+        status(f"{gap_segments} segment(s) marked #EXT-X-GAP — origin doesn't have them, "
+               f"skipped automatically", C.YELLOW)
     if disc_count:
         status(f"{disc_count} discontinuity marker(s) found (not necessarily ads)", C.GRAY)
+    if part_count:
+        status(f"{part_count} #EXT-X-PART partial-segment tag(s) — low-latency HLS source; "
+               f"parts aren't fetched separately, only their finalized full segments", C.GRAY)
 
 
 # --------------------------------------------------------------------------
@@ -697,19 +789,131 @@ def download_segment(session, seg, tmp_dir, ext, prefix="seg"):
 
 
 # --------------------------------------------------------------------------
+# aria2c backend (optional, for very large segment counts)
+# --------------------------------------------------------------------------
+
+def _aria2c_header_lines(session):
+    lines = []
+    ua = session.headers.get("User-Agent")
+    if ua:
+        lines.append(f"  header=User-Agent: {ua}")
+    ref = session.headers.get("Referer")
+    if ref:
+        lines.append(f"  header=Referer: {ref}")
+    org = session.headers.get("Origin")
+    if org:
+        lines.append(f"  header=Origin: {org}")
+    if session.cookies:
+        cookie_line = "; ".join(f"{n}={v}" for n, v in session.cookies.items())
+        lines.append(f"  header=Cookie: {cookie_line}")
+    return lines
+
+
+def download_batch_aria2c(session, candidates, tmp_dir, ext, prefix, workers):
+    """Fetch a batch of segments with an external aria2c process instead of
+    the built-in per-thread requests downloader — much faster once a
+    playlist runs into the thousands of segments. Segments are always
+    fetched raw here (aria2c doesn't know about HLS decryption) and then
+    decrypted in-process afterward, same as the requests backend. Returns
+    (succeeded, failed) where succeeded is a list of (Segment, byte_size)
+    and failed a list of (Segment, error_str) — or None if aria2c itself
+    couldn't be run at all, signaling the caller to fall back entirely."""
+    input_lines = []
+    header_lines = _aria2c_header_lines(session)
+    entries = {}
+    for s in candidates:
+        out_name = f"{prefix}_{s.seq:08d}{ext}.part"
+        entries[out_name] = s
+        input_lines.append(s.url)
+        input_lines.append(f"  out={out_name}")
+        input_lines.append(f"  dir={tmp_dir}")
+        input_lines.extend(header_lines)
+        if s.byte_range:
+            length, offset = s.byte_range
+            input_lines.append(f"  header=Range: bytes={offset}-{offset + length - 1}")
+
+    input_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write("\n".join(input_lines) + "\n")
+            input_path = f.name
+
+        cmd = ["aria2c", "-i", input_path,
+               "-j", str(max(1, workers)), "-x", "4", "-s", "1",
+               "--auto-file-renaming=false", "--allow-overwrite=true",
+               "--continue=true", "--summary-interval=0",
+               "--console-log-level=warn", "--check-certificate=false"]
+        if _RATE_LIMITER and _RATE_LIMITER.min_interval > 0:
+            # aria2c has no cross-request pacing knob; the closest honest
+            # approximation of "one request at a time" is one connection.
+            cmd[cmd.index("-j") + 1] = "1"
+            cmd[cmd.index("-x") + 1] = "1"
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return None
+    finally:
+        if input_path:
+            try:
+                os.remove(input_path)
+            except OSError:
+                pass
+
+    succeeded, failed = [], []
+    for out_name, s in entries.items():
+        raw_path = os.path.join(tmp_dir, out_name)
+        final_path = os.path.join(tmp_dir, f"{prefix}_{s.seq:08d}{ext}")
+        if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+            try:
+                with open(raw_path, "rb") as f:
+                    data = decrypt_segment(f.read(), s.key_info, s.seq, session)
+                with open(final_path, "wb") as f:
+                    f.write(data)
+                open(final_path + ".done", "w").close()
+                os.remove(raw_path)
+                succeeded.append((s, len(data)))
+            except Exception as e:
+                failed.append((s, str(e)))
+        else:
+            failed.append((s, "aria2c produced no output for this segment"))
+
+    if result.returncode != 0 and not succeeded:
+        return None
+    return succeeded, failed
+
+
+# --------------------------------------------------------------------------
 # One track's worth of download (video OR a selected audio track)
 # --------------------------------------------------------------------------
 
-def run_download(session, media_url, tmp_dir, workers, live_poll, skip_ads, prefix):
+def run_download(session, media_url, tmp_dir, workers, live_poll, skip_ads, prefix,
+                  aria2c=False, no_aria2c=False):
     """Download every segment of one media playlist (polling if live),
-    merge them, and return (raw_merged_path, ext, total_bytes, elapsed_sec)."""
+    merge them, and return (raw_merged_path, ext, total_bytes, elapsed_sec).
+
+    `aria2c=True` forces the aria2c backend (see download_batch_aria2c);
+    otherwise it's used automatically once a batch is large enough
+    (ARIA2C_AUTO_THRESHOLD) and aria2c is on PATH, unless `no_aria2c` was
+    given to disable it entirely."""
     seen_seqs = set()
     skipped_seqs = set()
     state = {"ext": ".ts", "init_path": None}
     stats = {"bytes": 0, "start": time.time()}
+    aria2c_available = (not no_aria2c) and shutil.which("aria2c") is not None
+    if aria2c and not aria2c_available and not no_aria2c:
+        warn("--aria2c given but aria2c isn't on PATH — using the built-in downloader instead.")
 
     def process_batch(segments):
         candidates = [s for s in segments if s.seq not in seen_seqs and s.seq not in skipped_seqs]
+
+        gaps = [s for s in candidates if s.is_gap]
+        if gaps:
+            for s in gaps:
+                skipped_seqs.add(s.seq)
+            candidates = [s for s in candidates if not s.is_gap]
+            warn(f"Skipping {len(gaps)} {prefix} segment(s) marked #EXT-X-GAP "
+                 f"(not present at the origin)")
+
         if skip_ads:
             ads = [s for s in candidates if s.is_ad]
             for s in ads:
@@ -730,52 +934,77 @@ def run_download(session, media_url, tmp_dir, workers, live_poll, skip_ads, pref
                     f.write(r.content)
 
         ext = state["ext"]
-        status(f"{len(candidates)} {prefix} segment(s) to download (workers: {workers})")
-
-        done = 0
-        lock = Lock()
-        failed = []
         total = len(candidates)
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(download_segment, session, s, tmp_dir, ext, prefix): s
-                       for s in candidates}
-            for future in as_completed(futures):
-                s = futures[future]
-                try:
-                    _, size = future.result()
-                    with lock:
-                        seen_seqs.add(s.seq)
-                        stats["bytes"] += size
-                except Exception as e:
-                    failed.append((s, str(e)))
-                if not QUIET:
-                    with lock:
-                        done += 1
-                        pct = done * 100 // total
-                        bar = "#" * (pct // 4) + "-" * (25 - pct // 4)
-                        elapsed = time.time() - stats["start"]
-                        speed_mb = stats["bytes"] / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
-                        avg = elapsed / done if done else 0
-                        eta = fmt_eta(avg * (total - done)) if avg else "?"
-                    print(f"\r  {C.BLUE}[{bar}]{C.RESET} {pct}% ({done}/{total})"
-                          f"  {speed_mb:.2f} MB/s  ETA {eta}",
-                          end="", file=sys.stderr, flush=True)
-        if not QUIET:
-            print(file=sys.stderr)
-
-        if failed:
-            warn(f"{len(failed)} {prefix} segment(s) failed, retrying sequentially...")
-            for s, err in failed:
-                try:
-                    _, size = download_segment(session, s, tmp_dir, ext, prefix)
+        use_aria2c = aria2c_available and (aria2c or total >= ARIA2C_AUTO_THRESHOLD)
+        if use_aria2c:
+            status(f"{total} {prefix} segment(s) to download — using aria2c backend", C.GRAY)
+            with Spinner(f"aria2c downloading {prefix} segments..."):
+                result = download_batch_aria2c(session, candidates, tmp_dir, ext, prefix, workers)
+            if result is None:
+                warn("aria2c backend failed entirely — falling back to the built-in downloader.")
+                use_aria2c = False
+            else:
+                succeeded, failed = result
+                for s, size in succeeded:
                     seen_seqs.add(s.seq)
                     stats["bytes"] += size
-                except Exception as e:
-                    error(f"Segment {s.seq} failed permanently: {e}")
+                success(f"{len(succeeded)}/{total} {prefix} segment(s) fetched via aria2c")
+                if failed:
+                    warn(f"{len(failed)} {prefix} segment(s) failed via aria2c, "
+                         f"retrying with the built-in downloader...")
+                    candidates = [s for s, _err in failed]
+                else:
+                    candidates = []
+
+        if candidates:
+            total = len(candidates)
+            status(f"{total} {prefix} segment(s) to download (workers: {workers})")
+
+            done = 0
+            lock = Lock()
+            failed = []
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(download_segment, session, s, tmp_dir, ext, prefix): s
+                           for s in candidates}
+                for future in as_completed(futures):
+                    s = futures[future]
+                    try:
+                        _, size = future.result()
+                        with lock:
+                            seen_seqs.add(s.seq)
+                            stats["bytes"] += size
+                    except Exception as e:
+                        failed.append((s, str(e)))
+                    if not QUIET:
+                        with lock:
+                            done += 1
+                            pct = done * 100 // total
+                            bar = "#" * (pct // 4) + "-" * (25 - pct // 4)
+                            elapsed = time.time() - stats["start"]
+                            speed_mb = stats["bytes"] / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
+                            avg = elapsed / done if done else 0
+                            eta = fmt_eta(avg * (total - done)) if avg else "?"
+                        print(f"\r  {C.BLUE}[{bar}]{C.RESET} {pct}% ({done}/{total})"
+                              f"  {speed_mb:.2f} MB/s  ETA {eta}",
+                              end="", file=sys.stderr, flush=True)
+            if not QUIET:
+                print(file=sys.stderr)
+
+            if failed:
+                warn(f"{len(failed)} {prefix} segment(s) failed, retrying sequentially...")
+                for s, err in failed:
+                    try:
+                        _, size = download_segment(session, s, tmp_dir, ext, prefix)
+                        seen_seqs.add(s.seq)
+                        stats["bytes"] += size
+                    except Exception as e:
+                        error(f"Segment {s.seq} failed permanently: {e}")
 
     try:
-        _, segments, is_live, target_duration, _tracks, _disc = parse_playlist(session, media_url)
+        _, segments, is_live, target_duration, _tracks, _disc, _parts = \
+            parse_playlist(session, media_url)
         if not segments:
             sys.exit(f"No segments found in {prefix} playlist.")
         process_batch(segments)
@@ -785,7 +1014,8 @@ def run_download(session, media_url, tmp_dir, workers, live_poll, skip_ads, pref
             while is_live:
                 time.sleep(max(target_duration / 2, 1.0))
                 try:
-                    _, segments, is_live, target_duration, _tracks, _disc = parse_playlist(session, media_url)
+                    _, segments, is_live, target_duration, _tracks, _disc, _parts = \
+                        parse_playlist(session, media_url)
                 except Exception as e:
                     warn(f"Playlist refresh failed, retrying: {e}")
                     continue
@@ -808,6 +1038,97 @@ def run_download(session, media_url, tmp_dir, workers, live_poll, skip_ads, pref
 
     elapsed = time.time() - stats["start"]
     return raw_path, ext, stats["bytes"], elapsed
+
+
+# --------------------------------------------------------------------------
+# Interrupted-merge recovery — rebuild an output file from an existing
+# `<output>_parts/` directory without refetching anything.
+# --------------------------------------------------------------------------
+
+_SEG_DONE_RE = re.compile(r"^(video|audio)_(\d{8})(\.ts|\.mp4)\.done$")
+
+
+def merge_dir_to_file(tmp_dir, prefix):
+    """Rebuild the merged raw stream for `prefix` ('video' or 'audio')
+    purely from what's already on disk in tmp_dir — every segment that has
+    a completed '.done' marker, in sequence order, plus the init segment if
+    one was captured. This is exactly what run_download's own merge step
+    does at the end of a normal run, factored out so --resume-merge can
+    call it directly on a `_parts/` directory left over from an interrupted
+    or crashed run, with no network access at all. Returns (path, ext) or
+    (None, None) if nothing usable is present for this prefix."""
+    if not os.path.isdir(tmp_dir):
+        return None, None
+
+    init_path = os.path.join(tmp_dir, f"{prefix}_init.mp4")
+    has_init = os.path.exists(init_path)
+    ext = ".mp4" if has_init else None
+
+    seqs = {}
+    for name in os.listdir(tmp_dir):
+        m = _SEG_DONE_RE.match(name)
+        if not m or m.group(1) != prefix:
+            continue
+        seq, found_ext = int(m.group(2)), m.group(3)
+        seg_path = os.path.join(tmp_dir, f"{prefix}_{seq:08d}{found_ext}")
+        if os.path.exists(seg_path):
+            seqs[seq] = found_ext
+            ext = ext or found_ext
+
+    if not seqs and not has_init:
+        return None, None
+    ext = ext or ".ts"
+
+    merged_path = os.path.join(tmp_dir, f"{prefix}_merged{ext}")
+    with open(merged_path, "wb") as out:
+        if has_init:
+            with open(init_path, "rb") as f:
+                shutil.copyfileobj(f, out)
+        for seq in sorted(seqs):
+            seg_path = os.path.join(tmp_dir, f"{prefix}_{seq:08d}{seqs[seq]}")
+            with open(seg_path, "rb") as f:
+                shutil.copyfileobj(f, out)
+    return merged_path, ext
+
+
+def resume_merge(output):
+    """--resume-merge entry point: no network activity at all. Rebuilds
+    video (and audio, if present) purely from '<output>_parts/', muxes them
+    with ffmpeg if both are present, and finalizes to `output` — for when a
+    run finished (or nearly finished) downloading but the merge/mux step
+    itself was interrupted or crashed."""
+    tmp_dir = output + "_parts"
+    if not os.path.isdir(tmp_dir):
+        sys.exit(f"No {tmp_dir} directory found — nothing to recover.")
+
+    status(f"Rebuilding from {tmp_dir} — no network access, using what's on disk...")
+    video_path, _vext = merge_dir_to_file(tmp_dir, "video")
+    if video_path is None:
+        sys.exit(f"No completed video segments found in {tmp_dir}.")
+    audio_path, _aext = merge_dir_to_file(tmp_dir, "audio")
+
+    if audio_path and shutil.which("ffmpeg"):
+        status("Muxing recovered video with recovered audio track (ffmpeg)...")
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+             "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", output],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if result.returncode != 0 or not os.path.exists(output) or os.path.getsize(output) == 0:
+            warn("Audio mux failed — falling back to video-only output.")
+            _finalize_video_only(video_path, output)
+    else:
+        if audio_path:
+            warn("ffmpeg not found — can't mux the separate audio track; keeping video-only output.")
+        _finalize_video_only(video_path, output)
+
+    for p in (video_path, audio_path):
+        if p and os.path.exists(p) and os.path.abspath(p) != os.path.abspath(output):
+            os.remove(p)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    size_mb = os.path.getsize(output) / (1024 * 1024)
+    success(f"Recovered: {output} ({size_mb:.1f} MB)")
 
 
 def _finalize_video_only(raw_path, output):
@@ -836,28 +1157,39 @@ def _finalize_video_only(raw_path, output):
 
 def download_hls(m3u8_url, output="output.mp4", workers=8, preferred_height=None,
                   referer=None, origin=None, user_agent=None, page_url=None,
-                  cookie=None, rate=None,
+                  cookie=None, cookies_from_browser=None, rate=None,
                   live_poll=True, skip_ads=False, audio_index=None,
-                  quiet=False, probe=False):
+                  quiet=False, probe=False, aria2c=False, no_aria2c=False):
     global QUIET, _RATE_LIMITER
     QUIET = quiet
-    if rate:
-        _RATE_LIMITER = RateLimiter(rate)
-        status(f"Rate limit: {rate:g} request(s)/second across all workers", C.GRAY)
 
     host = urlparse(m3u8_url).hostname
-    remember_profile(host, referer, origin, user_agent)  # only saves if explicitly given
+    # Only saves headers/rate that were explicitly given — never auto-derived
+    # guesses — so the cache only ever holds values a person confirmed work.
+    remember_profile(host, referer, origin, user_agent, rate)
 
     if referer is None and origin is None and user_agent is None:
         cached = get_cached_profile(host)
-        if cached:
+        if cached and any(cached.get(k) for k in ("referer", "origin", "user_agent")):
             referer = cached.get("referer")
             origin = cached.get("origin")
             user_agent = cached.get("user_agent")
             status(f"Using remembered header profile for {host}", C.GRAY)
 
+    if rate is None:
+        cached = get_cached_profile(host)
+        cached_rate = cached.get("rate") if cached else None
+        if cached_rate:
+            rate = cached_rate
+            status(f"Using remembered rate limit for {host}: {rate:g} req/s", C.GRAY)
+
+    if rate:
+        _RATE_LIMITER = RateLimiter(rate)
+        status(f"Rate limit: {rate:g} request(s)/second across all workers", C.GRAY)
+
     session = build_session(m3u8_url=m3u8_url, page_url=page_url, referer=referer,
-                             origin=origin, user_agent=user_agent, cookie=cookie)
+                             origin=origin, user_agent=user_agent, cookie=cookie,
+                             cookies_from_browser=cookies_from_browser)
     if not referer and not page_url and not get_cached_profile(host):
         auto_ref = session.headers.get("Referer")
         status(f"Auto Referer/Origin: {auto_ref}" if auto_ref else
@@ -873,7 +1205,8 @@ def download_hls(m3u8_url, output="output.mp4", workers=8, preferred_height=None
     os.makedirs(tmp_dir, exist_ok=True)
 
     video_path, _ext, _vb, _vt = run_download(session, media_url, tmp_dir, workers,
-                                                live_poll, skip_ads, "video")
+                                                live_poll, skip_ads, "video",
+                                                aria2c=aria2c, no_aria2c=no_aria2c)
 
     audio_path = None
     if audio_index is not None:
@@ -885,7 +1218,8 @@ def download_hls(m3u8_url, output="output.mp4", workers=8, preferred_height=None
             track = audio_tracks[audio_index]
             status(f"Downloading audio track: {track.get('name') or track.get('language') or '?'}")
             audio_path, _aext, _ab, _at = run_download(session, track["url"], tmp_dir, workers,
-                                                         live_poll, skip_ads, "audio")
+                                                         live_poll, skip_ads, "audio",
+                                                         aria2c=aria2c, no_aria2c=no_aria2c)
 
     if audio_path and shutil.which("ffmpeg"):
         status("Muxing video with selected audio track (ffmpeg)...")
@@ -913,17 +1247,21 @@ def download_hls(m3u8_url, output="output.mp4", workers=8, preferred_height=None
 
 def main():
     parser = argparse.ArgumentParser(description="Download HLS (m3u8) streams")
-    parser.add_argument("url", help="m3u8 playlist URL")
+    parser.add_argument("url", nargs="?", default=None,
+                         help="m3u8 playlist URL. Not needed with --resume-merge.")
     parser.add_argument("-o", "--output", default=None,
                          help="Output filename. Default: derived from the URL's 'embed' "
-                              "query param if present, else output.mp4")
+                              "query param if present, else output.mp4. Required with "
+                              "--resume-merge (it names the '<output>_parts/' directory "
+                              "to recover from).")
     parser.add_argument("-q", "--quality", type=int, default=None, metavar="H",
                          help="Preferred max height, e.g. 720")
     parser.add_argument("-w", "--workers", type=int, default=8, help="Parallel downloads")
     parser.add_argument("--rate", type=float, default=None, metavar="RPS",
                          help="Max HTTP requests per second across ALL workers and request "
                               "types (e.g. --rate 1). Use for sources that publish rate "
-                              "limits — polite pacing beats getting blocked.")
+                              "limits — polite pacing beats getting blocked. Remembered "
+                              "per-host, like --referer/--origin/--user-agent.")
     parser.add_argument("--page-url", default=None,
                          help="URL of the page that embeds the stream; used to auto-derive "
                               "Referer/Origin when those aren't set explicitly")
@@ -942,6 +1280,13 @@ def main():
                          help="Raw Cookie header copied VERBATIM from DevTools (Network → the "
                               ".m3u8 request → Request Headers → cookie: line → Copy Value). "
                               "NOT saved to profiles.")
+    parser.add_argument("--cookies-from-browser", default=None, metavar="BROWSER",
+                         choices=sorted(BROWSER_COOKIE_LOADERS),
+                         help="Load cookies for this URL's host straight from an installed "
+                              "browser's cookie store instead of pasting --cookie by hand. "
+                              "Needs the browser-cookie3 package (pip install browser-cookie3). "
+                              "Choices: " + ", ".join(sorted(BROWSER_COOKIE_LOADERS)) + ". "
+                              "An explicit --cookie still wins on any name collision.")
     parser.add_argument("--audio", type=int, default=None, metavar="N",
                          help="Index of an alternate audio track to mux in (see --probe "
                               "to list available tracks)")
@@ -950,6 +1295,17 @@ def main():
     parser.add_argument("--no-live-poll", action="store_true",
                          help="For live playlists, grab what's there now and stop, "
                               "instead of polling for new segments")
+    parser.add_argument("--aria2c", action="store_true",
+                         help="Force the aria2c backend for segment downloads (needs aria2c "
+                              "on PATH). Normally used automatically once a batch reaches "
+                              f"{ARIA2C_AUTO_THRESHOLD} segments and aria2c is available.")
+    parser.add_argument("--no-aria2c", action="store_true",
+                         help="Never use aria2c, even for very large segment counts.")
+    parser.add_argument("--resume-merge", action="store_true",
+                         help="Skip the network entirely and rebuild --output from an "
+                              "existing '<output>_parts/' directory left over from an "
+                              "interrupted run — for when segments finished downloading "
+                              "but the merge/mux step itself didn't complete. Requires -o.")
     parser.add_argument("--probe", action="store_true",
                          help="Report variants, audio tracks, encryption, and live/VOD "
                               "status, then exit without downloading")
@@ -958,6 +1314,22 @@ def main():
                               "and the final result line are printed")
     args = parser.parse_args()
 
+    if args.resume_merge:
+        if not args.output:
+            parser.error("--resume-merge needs -o/--output (it names the "
+                          "'<output>_parts/' directory to recover from)")
+        global QUIET
+        QUIET = args.quiet
+        try:
+            resume_merge(args.output)
+        except (Exception, SystemExit) as e:
+            error(str(e) or repr(e))
+            sys.exit(1)
+        return
+
+    if not args.url:
+        parser.error("url is required (unless using --resume-merge)")
+
     output = args.output or derive_output_name(args.url)
     start = time.time()
     ok, err_msg = True, None
@@ -965,10 +1337,12 @@ def main():
     try:
         download_hls(args.url, output, args.workers, args.quality,
                      referer=args.referer, origin=args.origin, user_agent=args.user_agent,
-                     page_url=args.page_url, cookie=args.cookie, rate=args.rate,
+                     page_url=args.page_url, cookie=args.cookie,
+                     cookies_from_browser=args.cookies_from_browser, rate=args.rate,
                      live_poll=not args.no_live_poll,
                      skip_ads=args.skip_ads, audio_index=args.audio,
-                     quiet=args.quiet, probe=args.probe)
+                     quiet=args.quiet, probe=args.probe,
+                     aria2c=args.aria2c, no_aria2c=args.no_aria2c)
     except (Exception, SystemExit) as e:
         ok = False
         err_msg = str(e) or repr(e)

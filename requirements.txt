@@ -1,2 +1,5 @@
 requests
 pycryptodome
+
+# Optional — only needed for specific flags:
+# browser-cookie3   for --cookies-from-browser

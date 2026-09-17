@@ -28,15 +28,19 @@ One file. Two dependencies. No install.
 | 🎵 **Alternate audio tracks** | Discovers `EXT-X-MEDIA:TYPE=AUDIO` tracks (languages, commentary) and muxes your pick in with ffmpeg |
 | 🔐 **AES-128 decryption** | Explicit and implicit (sequence-number) IVs; keys may rotate mid-playlist |
 | 📦 **fMP4 / CMAF & byte ranges** | Handles `EXT-X-MAP` init segments and `EXT-X-BYTERANGE`, including implicit offsets |
+| 🕳️ **Gap-aware** | Skips segments marked `EXT-X-GAP` (not actually present at the origin) instead of erroring on them; flags `EXT-X-PART` low-latency sources in `--probe` |
 | ✂️ **Ad-break skipping** | `--skip-ads` drops segments inside `EXT-X-CUE-OUT`/`EXT-X-CUE-IN` markers |
 | 📡 **Live capture** | Polls live playlists until `EXT-X-ENDLIST`, or `Ctrl-C` to stop and finalize what's captured |
 | ⚡ **Concurrent + resumable** | Parallel segment fetches with retry/backoff, `.done`-marker integrity, live speed/ETA readout |
+| 🚀 **aria2c backend** | Auto-engages for very large segment counts (or force with `--aria2c`) when `aria2c` is on `PATH` — falls back to the built-in downloader on failure |
+| 🩹 **Interrupted-merge recovery** | `--resume-merge` rebuilds the output straight from a leftover `<output>_parts/` directory — no refetching |
 | 🍪 **Verbatim cookies** | `--cookie` takes a raw `Cookie:` header pasted from DevTools — `HttpOnly` cookies included |
-| 🚦 **Polite rate limiting** | `--rate 1` paces *every* request (manifests, keys, segments, polls) across all worker threads |
+| 🌐 **Cookies from your browser** | `--cookies-from-browser firefox\|chrome\|...` pulls cookies straight from an installed browser's cookie store |
+| 🚦 **Polite rate limiting** | `--rate 1` paces *every* request (manifests, keys, segments, polls) across all worker threads — remembered per host |
 | 🛡️ **401/403 diagnostics** | Names the blocker (`Server` header + block-page body), prints targeted hints, and emits a ready-to-run `curl` replay |
-| 🧠 **Remembered header profiles** | Referer/Origin/User-Agent you set explicitly are cached per host — debug each source once |
+| 🧠 **Remembered header & rate profiles** | Referer/Origin/User-Agent/rate you set explicitly are cached per host — debug each source once |
 | 🏷️ **Auto-named output** | Derives a filename from the URL's `embed=` query param instead of a generic `output.mp4` |
-| 🔍 **Probe mode** | `--probe` reports qualities, audio tracks, encryption, live/VOD status, and ad markers without downloading |
+| 🔍 **Probe mode** | `--probe` reports qualities, audio tracks, encryption, live/VOD status, and ad/gap/part markers without downloading |
 | 🧹 **ffmpeg remux** | Clean MP4 container when ffmpeg is present; raw concatenated stream otherwise |
 | 📜 **Run history** | Every run appended to a local JSONL log |
 
@@ -69,6 +73,33 @@ winget install Gyan.FFmpeg
 ```
 
 Without ffmpeg you still get a valid concatenated stream file — it just won't be remuxed into a clean MP4, and separate audio tracks can't be muxed in.
+
+</details>
+
+<details>
+<summary><b>Optional: aria2c backend (large downloads)</b></summary>
+
+```bash
+# Debian/Ubuntu
+sudo apt install aria2
+# macOS
+brew install aria2
+# Windows
+winget install aria2.aria2
+```
+
+Once `aria2c` is on `PATH`, it's used automatically for very large segment counts (or force it any time with `--aria2c`; disable with `--no-aria2c`). Segments are still decrypted by this tool afterward — aria2c only handles the raw fetch.
+
+</details>
+
+<details>
+<summary><b>Optional: cookies straight from your browser</b></summary>
+
+```bash
+pip install browser-cookie3
+```
+
+Needed only for `--cookies-from-browser firefox|chrome|chromium|edge|brave|opera|vivaldi|safari`. Without it, `--cookie` (pasting the raw header from DevTools) still works exactly as before.
 
 </details>
 
@@ -108,14 +139,18 @@ python hls_downloader.py <m3u8_url> [options]
 | `-o`, `--output` | Output filename. Default: derived from the URL's `embed` param if present, else `output.mp4`. |
 | `-q`, `--quality` | Preferred max height (e.g. `720`). Auto-selects the best rendition at or below it, skipping the prompt. |
 | `-w`, `--workers` | Parallel segment downloads. Default `8`. Lower this if the source caps concurrent connections. |
-| `--rate` | Max HTTP requests **per second across all workers and request types** (e.g. `--rate 1`). For sources that publish rate limits. |
+| `--rate` | Max HTTP requests **per second across all workers and request types** (e.g. `--rate 1`). For sources that publish rate limits. Remembered per host, like `--referer`/`--origin`/`--user-agent`. |
 | `--page-url` | URL of the page that embeds the stream; auto-derives Referer/Origin — the strongest signal for Referer-checking CDNs. |
 | `--referer` / `--origin` | Explicit overrides. Remembered for this host next time. |
 | `--user-agent` | Custom UA string, remembered for this host. See the [warning below](#-when-downloads-are-blocked) before impersonating a browser. |
 | `--cookie` | Raw `Cookie:` header copied **verbatim** from DevTools → the failing request → Request Headers. Includes `HttpOnly` cookies. Never persisted. |
+| `--cookies-from-browser` | Load cookies for the URL's host straight from an installed browser (`firefox`, `chrome`, `chromium`, `edge`, `brave`, `opera`, `vivaldi`, `safari`). Needs `pip install browser-cookie3`. An explicit `--cookie` still wins on any name collision. |
 | `--audio N` | Index of an alternate audio track to mux in (`--probe` lists them). |
 | `--skip-ads` | Drop segments inside `CUE-OUT`/`CUE-IN` ad markers. |
 | `--no-live-poll` | Grab the live playlist's current window and stop instead of polling. |
+| `--aria2c` | Force the `aria2c` backend for segment downloads (needs `aria2c` on `PATH`). Otherwise used automatically once a batch is large enough. |
+| `--no-aria2c` | Never use `aria2c`, even for very large segment counts. |
+| `--resume-merge` | Skip the network entirely and rebuild `-o`'s output from a leftover `<output>_parts/` directory — for when segments finished downloading but the merge/mux step itself was interrupted. Requires `-o`; the URL can be omitted. |
 | `--probe` | Dry-run: report variants, audio, encryption, live/VOD status; download nothing. |
 | `--quiet` | Suppress status/spinner output; warnings, errors, and the final line still print. |
 
@@ -172,6 +207,24 @@ python hls_downloader.py "https://cdn.example.com/live/master.m3u8" --no-live-po
 python hls_downloader.py "https://cdn.example.com/master.m3u8" --quiet -o nightly.mp4
 ```
 
+**Cookies straight from Firefox, no copy-pasting:**
+
+```bash
+python hls_downloader.py "https://cdn.example.com/master.m3u8" --cookies-from-browser firefox
+```
+
+**Huge VOD, force the faster aria2c backend:**
+
+```bash
+python hls_downloader.py "https://cdn.example.com/master.m3u8" --aria2c -w 16
+```
+
+**Recover from an interrupted run** (segments finished downloading, but the merge/mux step got killed or crashed):
+
+```bash
+python hls_downloader.py --resume-merge -o video.mp4
+```
+
 </details>
 
 ## 🔍 How header auto-detection works
@@ -208,9 +261,9 @@ On the first 401/403, the tool prints everything needed to diagnose it in one pa
 
 | Path | Contents |
 |---|---|
-| `~/.config/hls_downloader/profiles.json` | Remembered Referer/Origin/User-Agent per host (never cookies — credentials) |
+| `~/.config/hls_downloader/profiles.json` | Remembered Referer/Origin/User-Agent/rate per host (never cookies — credentials) |
 | `~/.local/share/hls_downloader/history.jsonl` | One JSON line per run: timestamp, URL, output, success, duration, size |
-| `<output>_parts/` | In-progress segments next to the output file; removed automatically after merging |
+| `<output>_parts/` | In-progress segments next to the output file; removed automatically after merging. Left behind if a run is interrupted before the final merge/mux — `--resume-merge -o <output>` rebuilds straight from it, no refetching. |
 
 ## ❓ FAQ
 
@@ -239,6 +292,18 @@ No. Re-run the same command with the same `-o` filename: completed segments are 
 </details>
 
 <details>
+<summary><b>Segments all finished but the run died during merge/mux — do I have to redownload?</b></summary>
+
+No. As long as `<output>_parts/` is still there, run:
+
+```bash
+python hls_downloader.py --resume-merge -o video.mp4
+```
+
+This rebuilds the output entirely from what's on disk — no network access at all — then muxes/remuxes as normal.
+</details>
+
+<details>
 <summary><b>The player shows more quality levels than the tool does.</b></summary>
 
 Players invent renditions via ABR from whatever the master lists — the tool shows what's actually declared. If resolutions look wrong, check the master playlist for `RESOLUTION` attributes; renditions without them appear as `unknown` bandwidth estimates.
@@ -246,11 +311,11 @@ Players invent renditions via ABR from whatever the master lists — the tool sh
 
 ## 🧭 Roadmap
 
-- [ ] `--cookies-from-browser firefox|chrome` via `browser-cookie3`
-- [ ] Optional `aria2c` backend for very large segment counts
-- [ ] HLS `EXT-X-GAP` / partial-segment (`EXT-X-PART`) awareness
-- [ ] Per-host remembered rate limits alongside header profiles
-- [ ] Interrupted-merge recovery (rebuild output from `_parts/` without refetching)
+- [x] `--cookies-from-browser firefox|chrome` via `browser-cookie3`
+- [x] Optional `aria2c` backend for very large segment counts
+- [x] HLS `EXT-X-GAP` / partial-segment (`EXT-X-PART`) awareness
+- [x] Per-host remembered rate limits alongside header profiles
+- [x] Interrupted-merge recovery (rebuild output from `_parts/` without refetching)
 
 ## 🤝 Contributing
 
