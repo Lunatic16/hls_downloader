@@ -45,7 +45,7 @@ One file. Two dependencies. No install.
 **Requirements:** Python 3.8+, [`requests`](https://pypi.org/project/requests/), and [`pycryptodome`](https://pypi.org/project/pycryptodome/) (only for AES-128 streams). [`ffmpeg`](https://ffmpeg.org/) on `PATH` is optional but recommended.
 
 ```bash
-git clone https://github.com/Lunatic16/hls-downloader.git
+git clone https://github.com/Lunatic16/hls_downloader.git
 cd hls-downloader
 pip install -r requirements.txt        # requests, pycryptodome
 ```
