@@ -1,6 +1,6 @@
 <div align="center">
 
-# hls-downloader
+# HLS Downloader
 
 **Download, decrypt, and remux HLS (`.m3u8`) streams from the terminal — VOD or live.**
 
