@@ -75,6 +75,19 @@ python hls_downloader.py --help
 ```
 
 <details>
+<summary><b>Optional: cookies straight from your browser</b></summary>
+
+```bash
+pip install browser-cookie3
+```
+
+Needed only for `--cookies-from-browser firefox|chrome|chromium|edge|brave|opera|vivaldi|safari`. Without it, `--cookie` (pasting the raw header from DevTools) still works exactly as before. On Linux this reads the key via your desktop keyring (GNOME Keyring/KWallet) — the browser and keyring must be unlocked; on locked/headless sessions use `--cookie` instead.
+
+Extraction reads each browser's standard profile location plus the XDG layout (`~/.config/mozilla/…` on Firefox 121+/Fedora), Snap (`~/snap/<name>/…`), and Flatpak (`~/.var/app/<app-id>/…`) installs. On failure, the error names the profile directories actually present on your machine, with a ready-made symlink fix for sandboxed installs.
+
+</details>
+
+<details>
 <summary><b>Installing ffmpeg (optional)</b></summary>
 
 ```bash
@@ -103,19 +116,6 @@ winget install aria2.aria2
 ```
 
 Once `aria2c` is on `PATH`, it's used automatically for very large segment counts (or force it any time with `--aria2c`; disable with `--no-aria2c`). Segments are still decrypted by this tool afterward — aria2c only handles the raw fetch.
-
-</details>
-
-<details>
-<summary><b>Optional: cookies straight from your browser</b></summary>
-
-```bash
-pip install browser-cookie3
-```
-
-Needed only for `--cookies-from-browser firefox|chrome|chromium|edge|brave|opera|vivaldi|safari`. Without it, `--cookie` (pasting the raw header from DevTools) still works exactly as before. On Linux this reads the key via your desktop keyring (GNOME Keyring/KWallet) — the browser and keyring must be unlocked; on locked/headless sessions use `--cookie` instead.
-
-Extraction reads each browser's standard profile location plus the XDG layout (`~/.config/mozilla/…` on Firefox 121+/Fedora), Snap (`~/snap/<name>/…`), and Flatpak (`~/.var/app/<app-id>/…`) installs. On failure, the error names the profile directories actually present on your machine, with a ready-made symlink fix for sandboxed installs.
 
 </details>
 
