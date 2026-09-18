@@ -18,7 +18,7 @@ One file. Two dependencies. No install.
 
 ---
 
-`hls_downloader.py` is a single-file CLI for archiving HTTP Live Streaming media: it parses master and media playlists, handles quality, audio-track, and subtitle-track selection, decrypts AES-128 segments *and* per-sample SAMPLE-AES (CENC/CBCS) fMP4/CMAF segments, downloads concurrently with resume, and remuxes to a clean MP4. It also plays nice with anti-bot frontends — it diagnoses 401/403 blocks, tells you when cookies can and can't matter, supports verbatim browser cookies, and lets you identify your client honestly and pace your requests for sites that publish bot policies.
+`hls_downloader.py` is a single-file CLI for archiving HTTP Live Streaming media: it parses master and media playlists, handles quality, audio-track, and subtitle-track selection, decrypts AES-128 segments *and* per-sample SAMPLE-AES (CENC/CBCS) fMP4/CMAF segments, downloads concurrently with resume, and remuxes to a clean MKV by default (MP4 too, if you name the output `.mp4`). It also plays nice with anti-bot frontends — it diagnoses 401/403 blocks, tells you when cookies can and can't matter, supports verbatim browser cookies, and lets you identify your client honestly and pace your requests for sites that publish bot policies.
 
 ## ✨ Features
 
@@ -26,7 +26,7 @@ One file. Two dependencies. No install.
 |---|---|
 | 🎚️ **Quality selection** | Lists every rendition in the master playlist — choose interactively, or auto-pick with `-q 720` |
 | 🎵 **Alternate audio tracks** | Discovers `EXT-X-MEDIA:TYPE=AUDIO` tracks (languages, commentary) and muxes your pick in with ffmpeg |
-| 💬 **Subtitles** | Discovers `EXT-X-MEDIA:TYPE=SUBTITLES` tracks; `--subs N` downloads the WebVTT track and muxes it in as `mov_text` |
+| 💬 **Subtitles** | Discovers `EXT-X-MEDIA:TYPE=SUBTITLES` tracks; `--subs N` downloads the WebVTT track and muxes it in natively (or as `mov_text` if your output is `.mp4`/`.mov`) |
 | 🔐 **AES-128 decryption** | Explicit and implicit (sequence-number) IVs; keys may rotate mid-playlist |
 | 🔑 **SAMPLE-AES (CENC/CBCS)** | Per-sample `SAMPLE-AES`/`SAMPLE-AES-CTR` decryption for fMP4/CMAF (`cenc`/`cbcs`, clearkey); DRM key formats are detected and refused with a clear message |
 | 📦 **fMP4 / CMAF & byte ranges** | Handles `EXT-X-MAP` init segments and `EXT-X-BYTERANGE`, including implicit offsets |
@@ -49,13 +49,13 @@ One file. Two dependencies. No install.
 | 🧠 **Remembered header, rate & page profiles** | Referer/Origin/User-Agent/rate/`--page-url` you set explicitly are cached per host — debug each source once |
 | 🔒 **Output locking** | `<output>.lock` prevents two concurrent runs (cron + manual) from corrupting the same `_parts/` directory |
 | 🩺 **Post-merge integrity check** | ffprobes the final file and warns if its duration deviates from the playlist's summed EXTINF time |
-| 🏷️ **Auto-named output** | Derives a filename from the URL's `embed=` query param instead of a generic `output.mp4` |
+| 🏷️ **Auto-named output** | Derives a filename from the URL's `embed=` query param instead of a generic `output.mkv` |
 | 🔍 **Probe mode** | `--probe` reports qualities, audio/subtitle tracks, encryption, live/VOD status, and ad/gap/part markers without downloading |
 | 📏 **`--estimate`** | With `--probe`: approximate file size from the variant's declared bandwidth × playlist duration |
 | 🧾 **`--json`** | Machine-readable probe reports and final results on stdout — no scraping colored stderr |
 | 📋 **Batch mode** | `--batch urls.txt` (or `-` for stdin): sequential downloads, per-item history, one failure never stops the rest |
 | 🩺 **`--doctor`** | One command reports whether ffmpeg, aria2c, pycryptodome, and the cookie library are present — plus which browsers' profiles are readable |
-| 🧹 **ffmpeg remux** | Clean MP4 container when ffmpeg is present; raw concatenated stream otherwise |
+| 🧹 **ffmpeg remux** | Clean container (MKV by default, MP4 if you name the output `.mp4`) when ffmpeg is present; raw concatenated stream otherwise |
 | 📜 **Run history** | Every run appended to a local JSONL log |
 
 ## 📦 Installation
@@ -73,19 +73,6 @@ No package, no entry point — the tool *is* the one file:
 ```bash
 python hls_downloader.py --help
 ```
-
-<details>
-<summary><b>Optional: cookies straight from your browser</b></summary>
-
-```bash
-pip install browser-cookie3
-```
-
-Needed only for `--cookies-from-browser firefox|chrome|chromium|edge|brave|opera|vivaldi|safari`. Without it, `--cookie` (pasting the raw header from DevTools) still works exactly as before. On Linux this reads the key via your desktop keyring (GNOME Keyring/KWallet) — the browser and keyring must be unlocked; on locked/headless sessions use `--cookie` instead.
-
-Extraction reads each browser's standard profile location plus the XDG layout (`~/.config/mozilla/…` on Firefox 121+/Fedora), Snap (`~/snap/<name>/…`), and Flatpak (`~/.var/app/<app-id>/…`) installs. On failure, the error names the profile directories actually present on your machine, with a ready-made symlink fix for sandboxed installs.
-
-</details>
 
 <details>
 <summary><b>Installing ffmpeg (optional)</b></summary>
@@ -119,14 +106,27 @@ Once `aria2c` is on `PATH`, it's used automatically for very large segment count
 
 </details>
 
+<details>
+<summary><b>Optional: cookies straight from your browser</b></summary>
+
+```bash
+pip install browser-cookie3
+```
+
+Needed only for `--cookies-from-browser firefox|chrome|chromium|edge|brave|opera|vivaldi|safari`. Without it, `--cookie` (pasting the raw header from DevTools) still works exactly as before. On Linux this reads the key via your desktop keyring (GNOME Keyring/KWallet) — the browser and keyring must be unlocked; on locked/headless sessions use `--cookie` instead.
+
+Extraction reads each browser's standard profile location plus the XDG layout (`~/.config/mozilla/…` on Firefox 121+/Fedora), Snap (`~/snap/<name>/…`), and Flatpak (`~/.var/app/<app-id>/…`) installs. On failure, the error names the profile directories actually present on your machine, with a ready-made symlink fix for sandboxed installs.
+
+</details>
+
 ## 🚀 Quick start
 
 ```bash
 # 1. See what a source offers — no download yet
 python hls_downloader.py "https://cdn.example.com/master.m3u8" --probe
 
-# 2. Download at up to 1080p
-python hls_downloader.py "https://cdn.example.com/master.m3u8" -q 1080 -o video.mp4
+# 2. Download at up to 1080p (defaults to output.mkv; add -o file.mp4 for MP4 instead)
+python hls_downloader.py "https://cdn.example.com/master.m3u8" -q 1080 -o video.mkv
 ```
 
 Typical probe output:
@@ -155,7 +155,7 @@ python hls_downloader.py <m3u8_url> [options]
 
 | Flag | Description |
 |---|---|
-| `-o`, `--output` | Output filename. Default: derived from the URL's `embed` param if present, else `output.mp4`. Ignored with `--batch`. |
+| `-o`, `--output` | Output filename. Default: derived from the URL's `embed` param if present, else `output.mkv`. The container is picked from this filename's extension — `.mkv` (default) keeps subtitles as a native track and tolerates messier fMP4/TS timestamps; use `.mp4`/`.mov` for wider device compatibility (subtitles get converted to `mov_text`). Ignored with `--batch`. |
 | `-q`, `--quality` | Preferred max height (e.g. `720`). Auto-selects the best rendition at or below it, skipping the prompt. |
 | `-w`, `--workers` | Parallel segment downloads. Default `8`. Lower this if the source caps concurrent connections. |
 | `--rate` | Max HTTP requests **per second across all workers and request types** (e.g. `--rate 1`). For sources that publish rate limits. Remembered per host. |
@@ -167,7 +167,7 @@ python hls_downloader.py <m3u8_url> [options]
 | `--cookie` | Raw `Cookie:` header copied **verbatim** from DevTools → the failing request → Request Headers. Includes `HttpOnly` cookies. Never persisted. |
 | `--cookies-from-browser` | Load cookies for the URL's host straight from an installed browser (`firefox`, `chrome`, `chromium`, `edge`, `brave`, `opera`, `vivaldi`, `safari`). Needs `pip install browser-cookie3`. An explicit `--cookie` still wins on any name collision. The tool warns when cookies can't matter (signed URLs), continues cookieless if extraction fails, checks the URL's JWT expiry, and diagnoses profile-location problems (XDG/Snap/Flatpak) with symlink fixes. |
 | `--audio N` | Index of an alternate audio track to mux in (`--probe` lists them). Downloaded concurrently with video. |
-| `--subs N` | Index of a subtitle track (`--probe` lists them); the WebVTT is assembled and muxed in as a `mov_text` track. |
+| `--subs N` | Index of a subtitle track (`--probe` lists them); the WebVTT is assembled and muxed in as a native subtitle track (`mov_text` only if `-o` is `.mp4`/`.mov`). |
 | `--skip-ads` | Drop segments inside `CUE-OUT`/`CUE-IN` ad markers. |
 | `--no-live-poll` | Grab the live playlist's current window and stop instead of polling. |
 | `--aria2c` | Force the `aria2c` backend for segment downloads (needs `aria2c` on `PATH`). Otherwise used automatically once a batch is large enough. |
@@ -209,7 +209,7 @@ python hls_downloader.py "https://cdn.example.com/master.m3u8" \
 **Live stream** — record until it ends or `Ctrl-C` to finalize early:
 
 ```bash
-python hls_downloader.py "https://cdn.example.com/live/master.m3u8" -o live.mp4
+python hls_downloader.py "https://cdn.example.com/live/master.m3u8" -o live.mkv
 ```
 
 <details>
@@ -263,7 +263,7 @@ python hls_downloader.py "https://cdn.example.com/live/master.m3u8" --no-live-po
 **Quiet mode for cron:**
 
 ```bash
-python hls_downloader.py "https://cdn.example.com/master.m3u8" --quiet -o nightly.mp4
+python hls_downloader.py "https://cdn.example.com/master.m3u8" --quiet -o nightly.mkv
 ```
 
 **Cookies straight from Firefox, no copy-pasting:**
@@ -340,6 +340,12 @@ Usually no. If the URL contains `token=`/`signature=`/`e=&s=` (the tool tells yo
 </details>
 
 <details>
+<summary><b>Why does it default to <code>.mkv</code> instead of <code>.mp4</code>?</b></summary>
+
+Three reasons: Matroska holds the downloaded WebVTT subtitle track natively instead of converting it to MP4's lossier `mov_text`; it's more tolerant of the timestamp irregularities that show up when concatenating raw HLS TS/fMP4 segments (fewer "mux failed, falling back to video-only" cases); and it isn't picky about which video/audio codec it's asked to hold. Pass `-o something.mp4` any time you need MP4 for a specific device or player — everything (subtitle muxing, remuxing, `--resume-merge`) adapts to whichever extension you choose.
+</details>
+
+<details>
 <summary><b><code>--cookies-from-browser</code> says it can't find my Firefox profile — why?</b></summary>
 
 Modern Firefox installs keep profiles in more than one place: the classic `~/.mozilla/firefox/`, the XDG layout `~/.config/mozilla/firefox/` (Firefox 121+, and Fedora's default), Snap's `~/snap/firefox/common/.mozilla/firefox/`, and Flatpak's `~/.var/app/org.mozilla.firefox/.mozilla/firefox/`. Some `browser-cookie3` builds only search the classic path. The tool checks which of these actually exist on your machine and prints the exact location plus a symlink fix, e.g. `ln -s ~/.config/mozilla ~/.mozilla` — or just `pip install -U browser-cookie3`. `--doctor` lists which browsers' profiles are readable before you even try.
@@ -411,6 +417,7 @@ Players invent renditions via ABR from whatever the master lists — the tool sh
 - [x] Proxy support (`--proxy` + env vars)
 - [x] Signed-URL / cookie-necessity detection with JWT expiry checking
 - [x] Cookie-extraction diagnostics: profile-location checks (XDG/Snap/Flatpak) with symlink fixes
+- [x] MKV as the default output container (native subtitle track instead of lossy `mov_text`); `.mp4` still fully supported via `-o file.mp4`
 
 ## 🤝 Contributing
 
