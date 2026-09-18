@@ -21,7 +21,7 @@ abort, always exit code 130, never a shutdown hang), an optional aria2c
 backend, and a Tokyo Night-themed progress display.
 
 Usage:
-    python hls_downloader.py <m3u8_url> [-o output.mp4] [-q 720] [-w 8]
+    python hls_downloader.py <m3u8_url> [-o output.mkv] [-q 720] [-w 8]
                               [--rate 1] [--limit-rate 2M] [--proxy URL]
                               [--referer URL] [--origin URL]
                               [--user-agent UA] [--page-url URL]
@@ -492,8 +492,8 @@ def derive_output_name(url):
     qs = parse_qs(urlparse(url).query)
     embed = qs.get("embed", [None])[0]
     if embed:
-        return embed.replace("/", "-") + ".mp4"
-    return "output.mp4"
+        return embed.replace("/", "-") + ".mkv"
+    return "output.mkv"
 
 
 # --------------------------------------------------------------------------
@@ -1242,8 +1242,13 @@ def probe_playlist(session, url, as_json=False, estimate=False):
             for _u, bw in pl.iframes:
                 print(f"  {C.GRAY}(i) I-frame preview, {bw // 1000} kbps — preview/thumbnail "
                       f"rendition, not downloadable as media{C.RESET}", file=sys.stderr)
-        # Descend one level into the first variant for media-level info.
+        # Descend one level into the first variant for media-level info,
+        # but keep the master's audio/subtitle tracks — #EXT-X-MEDIA only
+        # ever appears there, never in the variant playlist itself.
+        master_audio_tracks = pl.audio_tracks
+        master_subtitle_tracks = pl.subtitle_tracks
         pl = parse_playlist(session, pl.variants[0][0])
+        pl = pl._replace(audio_tracks=master_audio_tracks, subtitle_tracks=master_subtitle_tracks)
     else:
         report["type"] = "media"
 
@@ -2255,7 +2260,7 @@ def resume_merge(output):
                 cmd += ["-map", f"{2 if audio_path else 1}:s:0"]
             cmd += ["-c", "copy"]
             if subs_path:
-                cmd += ["-c:s", "mov_text"]   # after -c copy — last match wins
+                cmd += ["-c:s", _subtitle_mux_codec(output)]   # after -c copy — last match wins
             cmd += [output]
             result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode != 0 or not os.path.exists(output) or os.path.getsize(output) == 0:
@@ -2275,14 +2280,23 @@ def resume_merge(output):
     success(f"Recovered: {output} ({size_mb:.1f} MB)")
 
 
+def _subtitle_mux_codec(output):
+    """MP4/MOV can only hold text subtitles as 'mov_text' (lossy, no
+    styling). Matroska/WebM and other containers can hold the WebVTT
+    track as-is, so stream-copy it instead of re-encoding."""
+    ext = os.path.splitext(output)[1].lower()
+    return "mov_text" if ext in (".mp4", ".m4v", ".mov") else "copy"
+
+
 def _finalize_video_only(raw_path, output):
     """Move the raw concatenated stream to `output`, remuxing with ffmpeg
     into a clean container when available."""
     if os.path.abspath(raw_path) != os.path.abspath(output):
         shutil.move(raw_path, output)
     if shutil.which("ffmpeg"):
-        status("Remuxing to MP4 with ffmpeg...")
-        tmp_out = output + ".tmp.mp4"
+        out_ext = os.path.splitext(output)[1] or ".mp4"
+        status(f"Remuxing to {out_ext.lstrip('.').upper()} with ffmpeg...")
+        tmp_out = output + ".tmp" + out_ext
         result = subprocess.run(
             ["ffmpeg", "-y", "-i", output, "-c", "copy", tmp_out],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -2404,7 +2418,7 @@ def run_doctor():
 # Orchestration
 # --------------------------------------------------------------------------
 
-def download_hls(m3u8_url, output="output.mp4", workers=8, preferred_height=None,
+def download_hls(m3u8_url, output="output.mkv", workers=8, preferred_height=None,
                  referer=None, origin=None, user_agent=None, page_url=None,
                  cookie=None, cookies_from_browser=None, rate=None,
                  limit_rate=None, proxy=None,
@@ -2553,7 +2567,7 @@ def download_hls(m3u8_url, output="output.mp4", workers=8, preferred_height=None
                 cmd += ["-map", f"{2 if audio else 1}:s:0"]
             cmd += ["-c", "copy"]
             if subs_path:
-                cmd += ["-c:s", "mov_text"]   # after -c copy — last match wins
+                cmd += ["-c:s", _subtitle_mux_codec(output)]   # after -c copy — last match wins
             cmd += [output]
             result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode != 0 or not os.path.exists(output) or os.path.getsize(output) == 0:
@@ -2662,7 +2676,9 @@ def main():
     ap.add_argument("--cookie", help="raw Cookie: header copied verbatim from DevTools")
     ap.add_argument("--cookies-from-browser", choices=sorted(BROWSER_COOKIE_LOADERS))
     ap.add_argument("--audio", type=int, metavar="N", help="alternate audio track index (see --probe)")
-    ap.add_argument("--subs", type=int, metavar="N", help="subtitle track index — muxed in as mov_text")
+    ap.add_argument("--subs", type=int, metavar="N",
+                     help="subtitle track index — muxed as a native subtitle track "
+                          "(mov_text if output is .mp4/.mov)")
     ap.add_argument("--skip-ads", action="store_true")
     ap.add_argument("--no-live-poll", action="store_true")
     ap.add_argument("--aria2c", action="store_true")
