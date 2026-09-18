@@ -1097,6 +1097,7 @@ def parse_playlist(session, m3u8_url):
                     "keyformat": kf.group(1) if kf else "identity",
                 }
             elif method:
+                current_key = None
                 warn(f"#EXT-X-KEY METHOD={method.group(1)} without a key URI — "
                      f"treating this playlist section as unencrypted")
 
@@ -1200,8 +1201,13 @@ def select_variant(session, m3u8_url, preferred_height=None):
                 chosen, chosen_bw = best[0], best[2]
                 status(f"Auto-selected: {best[1]}p", C.GREEN)
             else:
-                chosen, chosen_bw = pl.variants[0][0], pl.variants[0][2]
-                status(f"No rendition ≤ {preferred_height}p — using highest available", C.GREEN)
+                # No variant fits the ceiling — actually find the highest
+                # available rather than assuming the master lists variants
+                # in any particular order.
+                highest = max(pl.variants, key=lambda v: v[2])
+                chosen, chosen_bw = highest[0], highest[2]
+                status(f"No rendition ≤ {preferred_height}p — using highest "
+                       f"available ({highest[1]}, {highest[2] // 1000} kbps)", C.GREEN)
         else:
             choice = input(f"{C.BOLD}Select quality [default 0]: {C.RESET}").strip()
             idx = int(choice) if choice.isdigit() and int(choice) < len(pl.variants) else 0
@@ -1859,7 +1865,10 @@ def run_download(session, media_url, tmp_dir, workers, live_poll, skip_ads, pref
     expected_dur = 0.0
     permanent_failures = []
     aria2c_available = (not no_aria2c) and shutil.which("aria2c") is not None
-    if aria2c and not aria2c_available and not no_aria2c:
+    if aria2c and no_aria2c:
+        warn("--aria2c and --no-aria2c both given — --no-aria2c wins; "
+             "using the built-in downloader instead.")
+    elif aria2c and not aria2c_available:
         warn("--aria2c given but aria2c isn't on PATH — using the built-in downloader instead.")
 
     def note_done(seg, size):
