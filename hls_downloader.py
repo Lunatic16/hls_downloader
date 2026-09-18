@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 HLS (m3u8) Downloader
-Features: master playlist quality selection, alternate audio track selection,
-WebVTT subtitle track selection and muxing, AES-128 decryption (explicit and
+Features: master playlist quality selection, alternate audio track selection
+(listed interactively; the DEFAULT rendition is auto-selected), WebVTT
+subtitle track selection and muxing, AES-128 decryption (explicit and
 implicit IVs, per-segment key rotation), SAMPLE-AES / SAMPLE-AES-CTR
 per-sample decryption for fMP4/CMAF (cenc/cbcs, clearkey), byte-range
 segments, fMP4 init-segment handling, ad-break skipping (CUE-OUT/CUE-IN),
@@ -14,10 +15,10 @@ expiry checking; graceful continuation when browser-cookie extraction fails,
 with per-browser profile-location diagnosis covering XDG/Snap/Flatpak
 installs), 401/403 diagnostics with curl-replay output, a run history log,
 probe/dry-run mode with size estimation and JSON output, batch mode, a
-doctor/self-check command, per-output locking, post-merge duration
-verification, clean Ctrl-C handling (finalize-the-partial or abort, always
-exit code 130, never a shutdown hang), an optional aria2c backend, and a
-Tokyo Night-themed progress display.
+doctor/self-check command, per-output locking, post-merge duration and
+silent-output verification, clean Ctrl-C handling (finalize-the-partial or
+abort, always exit code 130, never a shutdown hang), an optional aria2c
+backend, and a Tokyo Night-themed progress display.
 
 Usage:
     python hls_downloader.py <m3u8_url> [-o output.mp4] [-q 720] [-w 8]
@@ -1173,6 +1174,18 @@ def select_variant(session, m3u8_url, preferred_height=None):
         for _url, bw in pl.iframes:
             print(f"  {C.GRAY}(i) I-frame preview, {bw // 1000} kbps — not selectable{C.RESET}",
                   file=sys.stderr)
+        if audio_tracks:
+            print(f"  {C.GRAY}audio: "
+                  + ", ".join(t.get("name") or t.get("language") or "?"
+                              for t in audio_tracks)
+                  + f" — pick with --audio 0..{len(audio_tracks) - 1}{C.RESET}",
+                  file=sys.stderr)
+        if subtitle_tracks:
+            print(f"  {C.GRAY}subs: "
+                  + ", ".join(t.get("name") or t.get("language") or "?"
+                              for t in subtitle_tracks)
+                  + f" — add with --subs 0..{len(subtitle_tracks) - 1}{C.RESET}",
+                  file=sys.stderr)
 
         if preferred_height:
             best = None
@@ -2226,6 +2239,9 @@ def resume_merge(output):
             cmd += ["-map", "0:v:0"]
             if audio_path:
                 cmd += ["-map", "1:a:0"]
+            else:
+                # Keep audio muxed inside the video track (see download_hls).
+                cmd += ["-map", "0:a?"]
             if subs_path:
                 cmd += ["-map", f"{2 if audio_path else 1}:s:0"]
             cmd += ["-c", "copy"]
@@ -2271,7 +2287,7 @@ def _finalize_video_only(raw_path, output):
 
 
 # --------------------------------------------------------------------------
-# Post-merge integrity check
+# Post-merge integrity checks
 # --------------------------------------------------------------------------
 
 def verify_duration(output, expected_sec, tolerance=0.10, min_abs=2.0):
@@ -2293,6 +2309,26 @@ def verify_duration(output, expected_sec, tolerance=0.10, min_abs=2.0):
         warn(f"Output duration {fmt_eta(actual)} differs from the playlist's "
              f"expected {fmt_eta(expected_sec)} — segments may be missing or "
              f"the source changed under us")
+
+
+def verify_streams(output):
+    """Post-merge stream check: warn when the output has no audio track —
+    the signature of audio living in a separate rendition we didn't fetch
+    (or a source that's genuinely video-only). Never fails a download."""
+    if not shutil.which("ffprobe") or not os.path.exists(output):
+        return
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "json", output],
+            capture_output=True, text=True, timeout=30)
+        types = {s.get("codec_type") for s in json.loads(r.stdout).get("streams", [])}
+    except Exception:
+        return
+    if "audio" not in types:
+        warn("Output has NO audio stream. If this source serves audio as a "
+             "separate rendition, run --probe and retry with --audio N; "
+             "video-only masters are also possible")
 
 
 # --------------------------------------------------------------------------
@@ -2429,6 +2465,14 @@ def download_hls(m3u8_url, output="output.mp4", workers=8, preferred_height=None
                 warn(f"--audio {audio_index} is out of range (0-{len(audio_tracks) - 1}); ignoring")
             else:
                 audio_track = audio_tracks[audio_index]
+        elif audio_tracks:
+            # Player behavior: the DEFAULT=YES rendition is what a viewer
+            # hears, so record it unless --audio said otherwise.
+            auto = next((i for i, t in enumerate(audio_tracks) if t.get("default")), 0)
+            audio_track = audio_tracks[auto]
+            status(f"No --audio given — auto-selecting audio track [{auto}] "
+                   f"{audio_track.get('name') or audio_track.get('language') or '?'} "
+                   f"(--probe lists all)", C.GRAY)
 
         # Video and audio download concurrently — audio no longer waits for
         # video; both share the same session and rate limiters.
@@ -2491,6 +2535,11 @@ def download_hls(m3u8_url, output="output.mp4", workers=8, preferred_height=None
             cmd += ["-map", "0:v:0"]
             if audio:
                 cmd += ["-map", "1:a:0"]
+            else:
+                # No separate audio input — keep any audio stream muxed
+                # inside the video segments (single-variant live restreams
+                # usually carry A/V together). '?' = don't fail if absent.
+                cmd += ["-map", "0:a?"]
             if subs_path:
                 cmd += ["-map", f"{2 if audio else 1}:s:0"]
             cmd += ["-c", "copy"]
@@ -2519,6 +2568,7 @@ def download_hls(m3u8_url, output="output.mp4", workers=8, preferred_height=None
 
     expected = video.expected_duration
     verify_duration(output, expected)
+    verify_streams(output)
 
     elapsed = time.time() - t0
     size = os.path.getsize(output) if os.path.exists(output) else 0
